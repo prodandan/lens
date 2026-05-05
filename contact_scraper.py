@@ -1,5 +1,5 @@
 """
-Contact Scraper — extrage email + telefon din pagina /contact, header, footer
+Contact Scraper v2 — extrage email + telefon din pagina /contact, header, footer
 """
 
 import json
