@@ -2,6 +2,19 @@
 Contact Scraper — extrage email + telefon din pagina /contact, header, footer
 """
 
+import json
+import re
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+
 # ─────────────────────────────────────────────────────────────────────────────
 SITES = [
     "spy-shop.ro", "aden.ro", "teleshopromania.ro", "telemarket.ro",
@@ -85,19 +98,6 @@ NOREPLY_RE = re.compile(
     re.I
 )
 # ─────────────────────────────────────────────────────────────────────────────
-
-import json
-import re
-import signal
-import sys
-import time
-from datetime import datetime
-from pathlib import Path
-
-import requests
-from bs4 import BeautifulSoup
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
 
 PHONE_REGEX = re.compile(
     r'(?<!\d)(?:'
