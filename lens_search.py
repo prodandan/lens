@@ -6,8 +6,8 @@ Google Lens (via SerpApi) + ImgBB hosting + Excel output
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURARE — pune cheile tale aici
 # ─────────────────────────────────────────────────────────────────────────────
-SERPAPI_KEY  = "CHEIA_TA_SERPAPI"
-IMGBB_KEY    = "CHEIA_TA_IMGBB"
+SERPAPI_KEY  = "41df81253d7e77665ea86276c981db4f48c2b63410481542b776b2824d994ac6"
+IMGBB_KEY    = "77efb1da3ad80ccdcdad2f1ea6d350a1"
 
 IMAGES_FOLDER = r"C:\Users\Dan\Desktop\Poze produse"
 OUTPUT_EXCEL  = r"C:\Users\Dan\Desktop\rezultate_lens.xlsx"
