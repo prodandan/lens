@@ -1,5 +1,5 @@
 """
-Contact Scraper — extrage email + telefon din header/footer/pagina de contact
+Contact Scraper — extrage email + telefon din pagina /contact, header, footer
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,6 +62,28 @@ CHECKPOINT   = r"C:\Users\Dan\Desktop\contacte_progress.json"
 
 SCRAPE_DELAY    = 1.0
 REQUEST_TIMEOUT = 15
+
+# sluguri de contact încercate în ordine — primele sunt cele mai probabile
+CONTACT_SLUGS = [
+    "contact", "contacts", "contacte", "contact-us", "contactati-ne",
+    "despre-noi", "despre", "informatii-contact", "info",
+]
+
+# emailuri de la aceste domenii sunt platforme/servicii, nu contacte reale
+PLATFORM_DOMAINS = re.compile(
+    r'@.*(sentry|wix|wordpress|woocommerce|mailchimp|sendgrid|hubspot|'
+    r'google|facebook|microsoft|apple|amazon|cloudflare|gravatar|'
+    r'prestashop|opencart|magento|shopify|squarespace|example|'
+    r'yourdomain|domain\.com|test\.com|localhost)',
+    re.I
+)
+
+# prefixe de email care indică adrese sistem, nu contact
+NOREPLY_RE = re.compile(
+    r'^(noreply|no-reply|donotreply|do-not-reply|bounce|'
+    r'mailer-daemon|postmaster|webmaster|admin@(?!.*\.ro))',
+    re.I
+)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import json
@@ -71,38 +93,22 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 
-# ── regex ────────────────────────────────────────────────────────────────────
-EMAIL_REGEX = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
 PHONE_REGEX = re.compile(
     r'(?<!\d)(?:'
-    r'\+40[\s\-\.]?[23789]\d{8}'
-    r'|0[23789]\d{8}'
-    r'|[23789]\d{2}[\s\-\.]?\d{3}[\s\-\.]?\d{3}'
+    r'\+40[\s\.\-]?[23789]\d{2}[\s\.\-]?\d{3}[\s\.\-]?\d{3}'
+    r'|0[23789]\d{2}[\s\.\-]?\d{3}[\s\.\-]?\d{3}'
     r')(?!\d)'
 )
-FAKE_EMAIL = re.compile(
-    r'sentry\.io|wixpress\.com|googleapis\.com|gstatic\.com'
-    r'|schema\.org|example\.com|@\d+x\.'
-    r'|\.(png|jpg|gif|svg|webp|ico|css|js)$',
-    re.I
-)
-VALID_PHONE_RE = re.compile(r'^\+40[237]\d{8}$')
+EMAIL_REGEX = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
+VALID_PHONE = re.compile(r'^\+40[237]\d{8}$')
 
-# pagini de contact comune de încercat
-CONTACT_SLUGS = [
-    "contact", "contacte", "contact-us", "despre-noi", "despre",
-    "informatii-contact", "info", "ajutor", "help", "support",
-]
-
-HEADERS = {
+HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -160,20 +166,36 @@ def norm_phone(raw: str):
     else:
         return None
     num = num.replace(" ", "")
-    return num if VALID_PHONE_RE.match(num) else None
+    return num if VALID_PHONE.match(num) else None
 
 
-def ok_email(addr: str) -> bool:
-    if FAKE_EMAIL.search(addr):
+def ok_email(addr: str, domain: str = "") -> bool:
+    """Filtrează emailurile false sau de platformă."""
+    addr = addr.lower().strip()
+    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]{2,}$', addr):
         return False
-    return bool(re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]{2,}$', addr))
+    if PLATFORM_DOMAINS.search(addr):
+        return False
+    if NOREPLY_RE.match(addr.split("@")[0]):
+        return False
+    if re.search(r'\.(png|jpg|gif|svg|webp|ico|css|js)$', addr):
+        return False
+    return True
+
+
+def rank_email(addr: str, domain: str) -> int:
+    """Scor de prioritate: emailuri de pe domeniul propriu > restul."""
+    root = domain.replace("www.", "").split(".")[0]
+    if f"@{domain}" in addr or f"@{root}" in addr:
+        return 0   # cel mai bun
+    return 1
 
 
 # ── fetch ─────────────────────────────────────────────────────────────────────
 
-def fetch(url: str):
+def fetch(url: str) -> str | None:
     try:
-        r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT,
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT,
                          allow_redirects=True)
         if r.status_code < 400:
             return r.text
@@ -182,55 +204,88 @@ def fetch(url: str):
     return None
 
 
-# ── extragere contact dintr-un HTML ──────────────────────────────────────────
+# ── extragere din HTML ────────────────────────────────────────────────────────
 
-def extract_from_html(html: str, base_url: str):
+def extract(html: str, domain: str) -> tuple[list[str], list[str]]:
+    """
+    Extrage emailuri și telefoane dintr-un HTML.
+    Ordinea de prioritate:
+      1. mailto: și tel: link-uri (cel mai sigur)
+      2. JSON-LD schema.org
+      3. Zonele vizibile: header, footer, bandă top, secțiuni contact
+      (NU face regex pe tot HTML-ul brut — evită false positive din cod/template)
+    """
     emails: set[str] = set()
     phones: set[str] = set()
 
     soup = BeautifulSoup(html, "lxml")
 
-    # 1. mailto: și tel: — cea mai fiabilă sursă
+    # elimină taguri invizibile care conțin text de template
+    for tag in soup.find_all(["script", "style", "noscript", "template", "meta"]):
+        tag.decompose()
+
+    # 1. mailto: și tel: — sursa cea mai de încredere
     for a in soup.find_all("a", href=True):
-        h = a["href"]
-        if h.startswith("mailto:"):
+        h = a["href"].strip()
+        if h.lower().startswith("mailto:"):
             addr = h[7:].split("?")[0].strip().lower()
-            if ok_email(addr):
+            if ok_email(addr, domain):
                 emails.add(addr)
-        elif h.startswith("tel:"):
+        elif h.lower().startswith("tel:"):
             n = norm_phone(h[4:].strip())
             if n:
                 phones.add(n)
 
-    # 2. JSON-LD
+    # 2. JSON-LD schema.org
     for sc in soup.find_all("script", type="application/ld+json"):
         try:
-            _jsonld(json.loads(sc.string or ""), emails, phones)
+            _jsonld(json.loads(sc.string or "{}"), emails, phones, domain)
         except Exception:
             pass
 
-    # 3. header + footer — zone prioritare pentru regex
-    for zone_tag in ["header", "footer", "nav"]:
-        for zone in soup.find_all(zone_tag):
-            _regex_zone(zone.get_text(" ", strip=True), emails, phones)
+    # 3. Zone vizibile prioritare — text curat, fără cod
+    priority_zones = []
 
-    # zone cu clase/id sugestive
-    for sel in ["contact", "footer", "header", "topbar", "top-bar",
-                "info", "address", "sidebar"]:
-        for el in soup.find_all(class_=re.compile(sel, re.I)):
-            _regex_zone(el.get_text(" ", strip=True), emails, phones)
-        for el in soup.find_all(id=re.compile(sel, re.I)):
-            _regex_zone(el.get_text(" ", strip=True), emails, phones)
+    # <header>, <footer>, <nav>
+    for tag in ["header", "footer", "nav"]:
+        priority_zones.extend(soup.find_all(tag))
 
-    # 4. fallback regex pe tot HTML-ul
-    _regex_zone(html, emails, phones)
+    # elemente cu clase/id care sugerează contact sau bandă de info
+    contact_sel = re.compile(
+        r'contact|footer|header|topbar|top[-_]bar|top[-_]info|'
+        r'info[-_]bar|address|phone|email|tel[-_]|fax|'
+        r'social|widget[-_]contact|block[-_]contact',
+        re.I
+    )
+    for el in soup.find_all(class_=contact_sel):
+        priority_zones.append(el)
+    for el in soup.find_all(id=contact_sel):
+        priority_zones.append(el)
 
-    return sorted(emails), sorted(phones)
+    # extrage text curat din zone prioritare și aplică regex
+    seen_texts: set[str] = set()
+    for zone in priority_zones:
+        text = zone.get_text(" ", strip=True)
+        if text in seen_texts or len(text) < 5:
+            continue
+        seen_texts.add(text)
+        _regex_text(text, emails, phones, domain)
+
+    # 4. Fallback: întreg body-ul ca text curat (nu HTML brut)
+    # Folosim text vizibil, nu codul sursă — evită emailuri din JS/atribute
+    body = soup.find("body")
+    if body:
+        body_text = body.get_text(" ", strip=True)
+        _regex_text(body_text, emails, phones, domain)
+
+    # sortare: emailuri proprii primele
+    sorted_emails = sorted(emails, key=lambda e: rank_email(e, domain))
+    return sorted_emails, sorted(phones)
 
 
-def _regex_zone(text: str, emails: set, phones: set):
+def _regex_text(text: str, emails: set, phones: set, domain: str):
     for m in EMAIL_REGEX.findall(text):
-        if ok_email(m):
+        if ok_email(m, domain):
             emails.add(m.lower())
     for m in PHONE_REGEX.findall(text):
         n = norm_phone(m)
@@ -238,71 +293,85 @@ def _regex_zone(text: str, emails: set, phones: set):
             phones.add(n)
 
 
-def _jsonld(obj, emails, phones):
+def _jsonld(obj, emails, phones, domain):
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k in ("email", "contactEmail") and isinstance(v, str):
-                if ok_email(v):
+                if ok_email(v, domain):
                     emails.add(v.lower())
             elif k in ("telephone", "faxNumber") and isinstance(v, str):
                 n = norm_phone(v)
                 if n:
                     phones.add(n)
             else:
-                _jsonld(v, emails, phones)
+                _jsonld(v, emails, phones, domain)
     elif isinstance(obj, list):
         for i in obj:
-            _jsonld(i, emails, phones)
+            _jsonld(i, emails, phones, domain)
 
 
-# ── scraping complet per domeniu ──────────────────────────────────────────────
+# ── scraping per domeniu ──────────────────────────────────────────────────────
 
-def scrape_site(domain: str):
+def scrape_site(domain: str) -> tuple[list, list, str]:
+    """
+    Strategie:
+    1. Încearcă /contact, /contacts, /contacte (și variantele lor) — PRIMUL
+    2. Dacă nu găsește nimic acolo, cade pe homepage (header/footer)
+    Returnează (emails, phones, sursa_găsită)
+    """
+    # determină baza (https cu fallback http)
     base = f"https://{domain}"
+    test = fetch(base)
+    if test is None:
+        base = f"http://{domain}"
+
     emails: set[str] = set()
     phones: set[str] = set()
-    pages_tried: list[str] = []
+    source = ""
 
-    # --- homepage ---
-    html = fetch(base)
-    if html is None:
-        base = f"http://{domain}"
-        html = fetch(base)
-
-    if html:
-        pages_tried.append(base)
-        e, p = extract_from_html(html, base)
-        emails.update(e)
-        phones.update(p)
-
-    # --- pagini de contact ---
-    # încearcă slugurile standard; oprire la primul răspuns valid
+    # ── PASUL 1: pagini dedicate de contact ──────────────────────────────────
     for slug in CONTACT_SLUGS:
         if _shutdown:
             break
-        contact_url = f"{base}/{slug}"
-        time.sleep(0.4)
-        html2 = fetch(contact_url)
-        if html2 and len(html2) > 500:
-            pages_tried.append(contact_url)
-            e, p = extract_from_html(html2, base)
+        url = f"{base}/{slug}"
+        html = fetch(url)
+        if not html or len(html) < 300:
+            continue
+
+        e, p = extract(html, domain)
+        if e or p:
             emails.update(e)
             phones.update(p)
-            # dacă am găsit ceva, nu mai mergem mai departe
-            if emails or phones:
-                break
+            source = url
+            log(f"    ✓ contact găsit la /{slug}", None, None)
+            break   # am găsit — nu mai căutăm alte sluguri
 
-    return sorted(emails), sorted(phones), pages_tried
+    # ── PASUL 2: homepage — header + footer ca fallback ───────────────────────
+    if not emails and not phones:
+        html = fetch(base) if test is None else test
+        if html:
+            e, p = extract(html, domain)
+            if e or p:
+                emails.update(e)
+                phones.update(p)
+                source = base
+                log(f"    ✓ contact găsit în homepage", None, None)
+
+    if not emails and not phones:
+        source = "—"
+
+    sorted_emails = sorted(emails, key=lambda x: rank_email(x, domain))
+    return sorted_emails, sorted(phones), source
 
 
 # ── Excel ─────────────────────────────────────────────────────────────────────
 
 HDR_FILL   = PatternFill("solid", fgColor="1F4E79")
 HDR_FONT   = Font(bold=True, color="FFFFFF", size=10)
-ALT_FILL   = PatternFill("solid", fgColor="D6E4F0")
-PLAIN_FILL = PatternFill("solid", fgColor="FFFFFF")
-OK_FILL    = PatternFill("solid", fgColor="E8F5E9")
-NOK_FILL   = PatternFill("solid", fgColor="FFEBEE")
+OK_FILL    = PatternFill("solid", fgColor="E8F5E9")   # verde — contact găsit
+NOK_FILL   = PatternFill("solid", fgColor="FFEBEE")   # roșu  — negăsit
+ALT_OK     = PatternFill("solid", fgColor="C8E6C9")
+ALT_NOK    = PatternFill("solid", fgColor="FFCDD2")
 
 
 def _hdr(cell, text):
@@ -317,8 +386,7 @@ def build_excel(state: dict, path: str):
     ws = wb.active
     ws.title = "Contacte Site-uri"
 
-    headers = ["Nr", "Domeniu", "Email-uri", "Telefoane", "Status"]
-    for ci, h in enumerate(headers, 1):
+    for ci, h in enumerate(["Nr", "Domeniu", "Email-uri", "Telefoane", "Sursa", "Status"], 1):
         _hdr(ws.cell(row=1, column=ci), h)
 
     ws.freeze_panes = "A2"
@@ -330,31 +398,29 @@ def build_excel(state: dict, path: str):
         if data is None:
             continue
 
-        has_data = bool(data["emails"] or data["phones"])
-        if row % 2 == 0:
-            fill = OK_FILL if has_data else NOK_FILL
-        else:
-            fill = OK_FILL if has_data else PatternFill("solid", fgColor="FFF9C4")
+        has = bool(data["emails"] or data["phones"])
+        fill = (OK_FILL if row % 2 == 0 else ALT_OK) if has else (NOK_FILL if row % 2 == 0 else ALT_NOK)
+        status = "✓ găsit" if has else "— negăsit"
 
-        status = "✓ găsit" if has_data else "— negăsit"
-        vals = [
+        for ci, v in enumerate([
             row - 1,
             domain,
             ", ".join(data["emails"]),
             ", ".join(data["phones"]),
+            data.get("source", ""),
             status,
-        ]
-        for ci, v in enumerate(vals, 1):
+        ], 1):
             c = ws.cell(row=row, column=ci, value=v)
             c.fill = fill
             c.alignment = Alignment(wrap_text=True, vertical="top")
         row += 1
 
     ws.column_dimensions["A"].width = 5
-    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["B"].width = 28
     ws.column_dimensions["C"].width = 45
-    ws.column_dimensions["D"].width = 30
-    ws.column_dimensions["E"].width = 12
+    ws.column_dimensions["D"].width = 28
+    ws.column_dimensions["E"].width = 40
+    ws.column_dimensions["F"].width = 12
 
     wb.save(path)
 
@@ -367,32 +433,31 @@ def main():
     done  = set(state.get("done", []))
 
     if done:
-        log(f"Checkpoint găsit — {len(done)}/{total} site-uri deja procesate.")
+        log(f"Checkpoint găsit — {len(done)}/{total} deja procesate, reluăm de unde am rămas.")
 
     print("=" * 55)
-    print(f"  Site-uri de procesat: {total}")
+    print(f"  Site-uri total:       {total}")
     print(f"  Deja procesate:       {len(done)}")
-    print(f"  Rămase:               {total - len(done)}")
+    print(f"  De procesat acum:     {total - len(done)}")
     print("=" * 55)
 
     for idx, domain in enumerate(SITES, 1):
         if _shutdown:
             break
         if domain in done:
-            log(f"Skip (deja procesat): {domain}", idx, total)
+            log(f"Skip: {domain}", idx, total)
             continue
 
-        log(f"Scraping: {domain}", idx, total)
+        log(f"→ {domain}", idx, total)
         time.sleep(SCRAPE_DELAY)
 
-        emails, phones, pages = scrape_site(domain)
-
+        emails, phones, source = scrape_site(domain)
         log(f"  email={emails}  tel={phones}", idx, total)
 
         state["results"][domain] = {
             "emails": emails,
             "phones": phones,
-            "pages":  pages,
+            "source": source,
         }
         state["done"].append(domain)
         save_cp(state)
@@ -402,7 +467,6 @@ def main():
         except Exception as e:
             log(f"  Avertisment Excel: {e}", idx, total)
 
-    # sumar
     results = state["results"]
     found    = sum(1 for d in results.values() if d["emails"] or d["phones"])
     no_email = sum(1 for d in results.values() if not d["emails"])
@@ -411,13 +475,13 @@ def main():
     print("\n" + "=" * 55)
     print("  SUMAR FINAL")
     print("=" * 55)
-    print(f"  Site-uri procesate:       {len(results)}")
-    print(f"  Cu cel puțin un contact:  {found}")
-    print(f"  Fără email:               {no_email}")
-    print(f"  Fără telefon:             {no_phone}")
-    print(f"\n  Excel salvat la: {OUTPUT_EXCEL}")
+    print(f"  Site-uri procesate:        {len(results)}")
+    print(f"  Cu cel puțin un contact:   {found}")
+    print(f"  Fără email găsit:          {no_email}")
+    print(f"  Fără telefon găsit:        {no_phone}")
+    print(f"\n  Excel: {OUTPUT_EXCEL}")
     if _shutdown:
-        print("  (Oprit cu Ctrl+C — progresul e salvat)")
+        print("  (Oprit cu Ctrl+C — progresul salvat)")
 
 
 if __name__ == "__main__":
