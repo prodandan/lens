@@ -1,20 +1,22 @@
 """
 Reverse Image Search + Contact Extractor
-Google Lens (via SerpApi) + ImgBB (imagini preluate din cont) + Excel output
+Google Lens (via SerpApi) + ImgBB upload + Excel output
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURARE
 # ─────────────────────────────────────────────────────────────────────────────
-SERPAPI_KEY = "41df81253d7e77665ea86276c981db4f48c2b63410481542b776b2824d994ac6"
-IMGBB_KEY   = "77efb1da3ad80ccdcdad2f1ea6d350a1"
+SERPAPI_KEY   = "41df81253d7e77665ea86276c981db4f48c2b63410481542b776b2824d994ac6"
+IMGBB_KEY     = "77efb1da3ad80ccdcdad2f1ea6d350a1"
 
-OUTPUT_EXCEL = r"C:\Users\Dan\Desktop\rezultate_lens.xlsx"
-CHECKPOINT   = r"C:\Users\Dan\Desktop\lens_progress.json"
+IMAGES_FOLDER = r"C:\Users\Dan\Desktop\Poze produse"
+OUTPUT_EXCEL  = r"C:\Users\Dan\Desktop\rezultate_lens.xlsx"
+CHECKPOINT    = r"C:\Users\Dan\Desktop\lens_progress.json"
 
-LIMIT_IMAGES = 5        # None = toate; 5 = test pilot
+LIMIT_IMAGES  = 5       # None = toate; 5 = test pilot
 # ─────────────────────────────────────────────────────────────────────────────
 
+import base64
 import json
 import re
 import signal
@@ -85,61 +87,42 @@ def save_checkpoint(state: dict):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-# ── ImgBB: preia imaginile din cont ──────────────────────────────────────────
+# ── ImgBB upload ─────────────────────────────────────────────────────────────
 
-def fetch_imgbb_account_images() -> dict[int, dict]:
-    """
-    Preia toate imaginile din contul ImgBB și le indexează după numărul
-    din titlu (1.jpg → 1, 2.jpg → 2, etc.).
-    Returnează: {1: {"title": "1.jpg", "url": "https://i.ibb.co/..."}, ...}
-    """
-    log("Preluare imagini din contul ImgBB …")
-    images: dict[int, dict] = {}
-    page = 1
+def upload_imgbb(image_path: Path) -> str | None:
+    """Uploadează imaginea pe ImgBB (expiră în 1h) și returnează URL-ul public."""
+    try:
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        resp = requests.post(
+            "https://api.imgbb.com/1/upload",
+            data={"key": IMGBB_KEY, "image": b64, "expiration": 3600},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success"):
+            return data["data"]["url"]
+        log(f"  ImgBB eroare răspuns: {data}")
+        return None
+    except Exception as e:
+        log(f"  ImgBB upload eșuat ({image_path.name}): {e}")
+        return None
 
-    while True:
-        try:
-            resp = requests.get(
-                "https://api.imgbb.com/1/account/images",
-                params={"key": IMGBB_KEY, "page": page, "perpage": 200},
-                timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            log(f"  Eroare la pagina {page}: {e}")
-            break
 
-        if not data.get("success"):
-            log(f"  API error: {data}")
-            break
-
-        items = data.get("data", [])
-        if not items:
-            break
-
-        for item in items:
-            title = item.get("title", "") or item.get("name", "")
-            # acceptă "1", "1.jpg", "001.jpg" etc.
-            stem = Path(title).stem if title else ""
-            if stem.isdigit():
-                num = int(stem)
-                images[num] = {
-                    "title": title,
-                    "url":   item.get("url") or item.get("display_url", ""),
-                }
-
-        log(f"  Pagina {page}: {len(items)} imagini preluate (total numeric: {len(images)})")
-
-        # paginare
-        total_pages = data.get("data", {})
-        # ImgBB returnează câmpul de paginare diferit — verificăm dacă mai sunt pagini
-        if isinstance(data.get("data"), list) and len(items) < 200:
-            break
-        page += 1
-
-    log(f"Total imagini numerice găsite în cont: {len(images)}")
-    return images
+def list_local_images() -> list[Path]:
+    """Returnează imaginile numerice din IMAGES_FOLDER, sortate numeric."""
+    folder = Path(IMAGES_FOLDER)
+    if not folder.exists():
+        print(f"EROARE: Folderul nu există: {IMAGES_FOLDER}")
+        sys.exit(1)
+    files = sorted(
+        [p for p in folder.glob("*.jpg") if p.stem.isdigit()],
+        key=lambda p: int(p.stem),
+    )
+    if LIMIT_IMAGES:
+        files = files[:LIMIT_IMAGES]
+    return files
 
 
 # ── SerpApi Google Lens ───────────────────────────────────────────────────────
@@ -404,58 +387,62 @@ def build_excel(state: dict, output_path: str):
 def main():
     global _shutdown
 
-    # 1. Preia imaginile din contul ImgBB
-    imgbb_images = fetch_imgbb_account_images()
+    # 1. Listează imaginile locale
+    images = list_local_images()
+    total  = len(images)
 
-    if not imgbb_images:
-        print("EROARE: Nu s-au găsit imagini numerice în contul ImgBB.")
-        print("Verifică că imaginile sunt denumite 1.jpg, 2.jpg, ... și cheia API e corectă.")
+    if total == 0:
+        print(f"EROARE: Nicio imagine .jpg cu nume numeric găsită în:\n  {IMAGES_FOLDER}")
         sys.exit(1)
-
-    # sortare și limitare
-    all_nums = sorted(imgbb_images.keys())
-    if LIMIT_IMAGES:
-        all_nums = all_nums[:LIMIT_IMAGES]
-    total = len(all_nums)
 
     cost_est = total * 0.02
     print("=" * 60)
-    print(f"  Imagini în cont ImgBB:  {len(imgbb_images)}")
-    print(f"  Imagini de procesat:    {total}")
-    print(f"  Cost estimat SerpApi:   ~$0.02 × {total} = ~${cost_est:.2f}")
+    print(f"  Imagini găsite:        {total}")
+    print(f"  Cost estimat SerpApi:  ~$0.02 × {total} = ~${cost_est:.2f}")
     if LIMIT_IMAGES:
-        print(f"  MOD TEST:               LIMIT_IMAGES={LIMIT_IMAGES}")
+        print(f"  MOD TEST:              LIMIT_IMAGES={LIMIT_IMAGES}")
     print("=" * 60)
 
     # 2. Checkpoint
-    state = load_checkpoint()
-    done_set = set(str(n) for n in state.get("done", []))
+    state    = load_checkpoint()
+    done_set = set(str(p.stem) for p in images if str(p.stem) in state.get("done", []))
 
     skipped = len(done_set)
     if skipped:
         log(f"Checkpoint găsit — sar peste {skipped} imagini deja procesate.")
 
     # 3. Procesare
-    for idx, num in enumerate(all_nums, 1):
+    for idx, img_path in enumerate(images, 1):
         if _shutdown:
             break
 
-        img_key  = str(num)
-        img_info = imgbb_images[num]
-        filename = img_info["title"] or f"{num}.jpg"
-        pub_url  = img_info["url"]
+        img_key = img_path.stem   # "1", "2", ...
 
-        if img_key in done_set:
-            log(f"Deja procesat ({filename}), skip.", idx, total)
+        if img_key in state.get("done", []):
+            log(f"Deja procesat ({img_path.name}), skip.", idx, total)
             continue
 
-        log(f"Google Lens: {filename}  →  {pub_url[:60]}…", idx, total)
+        # Upload ImgBB
+        log(f"Upload ImgBB: {img_path.name}", idx, total)
+        pub_url = upload_imgbb(img_path)
+        if not pub_url:
+            log(f"  Upload eșuat — înregistrez fără site-uri.", idx, total)
+            state["results"][img_key] = {"filename": img_path.name, "sites": []}
+            state["done"].append(img_key)
+            save_checkpoint(state)
+            build_excel(state, OUTPUT_EXCEL)
+            continue
+
+        log(f"  → {pub_url[:70]}", idx, total)
+
+        # SerpApi
+        log(f"Google Lens …", idx, total)
         time.sleep(SERPAPI_DELAY)
 
         if _shutdown:
             break
 
-        matches = serpapi_lens(pub_url)
+        matches  = serpapi_lens(pub_url)
         ro_sites = top_ro_matches(matches)
         log(f"  → {len(ro_sites)} site-uri .ro găsite", idx, total)
 
@@ -475,7 +462,7 @@ def main():
                 "phones": phones,
             })
 
-        state["results"][img_key] = {"filename": filename, "sites": sites_data}
+        state["results"][img_key] = {"filename": img_path.name, "sites": sites_data}
         state["done"].append(img_key)
         save_checkpoint(state)
         log(f"Checkpoint + Excel salvat.", idx, total)
