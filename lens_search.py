@@ -6,7 +6,7 @@ Google Lens (via SerpApi) + ImgBB upload + Excel output
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURARE
 # ─────────────────────────────────────────────────────────────────────────────
-SERPAPI_KEY   = "41df81253d7e77665ea86276c981db4f48c2b63410481542b776b2824d994ac6"
+SERPAPI_KEY   = "91da37a76b3ac1c32479cbbfd1a821bd772820065099b691b236c859bf7971bb"
 IMGBB_KEY     = "77efb1da3ad80ccdcdad2f1ea6d350a1"
 
 IMAGES_FOLDER = r"C:\Users\Dan\Desktop\Poze produse"
@@ -14,6 +14,7 @@ OUTPUT_EXCEL  = r"C:\Users\Dan\Desktop\rezultate_lens.xlsx"
 CHECKPOINT    = r"C:\Users\Dan\Desktop\lens_progress.json"
 
 LIMIT_IMAGES  = None    # None = toate imaginile din folder
+START_FROM    = 249     # procesează doar imaginile cu număr >= această valoare
 
 BLACKLIST_DOMAINS = {
     "ieftinmag.ro", "cel.ro", "autoconfort.ro", "evomag.ro",
@@ -123,7 +124,7 @@ def list_local_images() -> list[Path]:
         print(f"EROARE: Folderul nu există: {IMAGES_FOLDER}")
         sys.exit(1)
     files = sorted(
-        [p for p in folder.glob("*.jpg") if p.stem.isdigit()],
+        [p for p in folder.glob("*.jpg") if p.stem.isdigit() and int(p.stem) >= START_FROM],
         key=lambda p: int(p.stem),
     )
     if LIMIT_IMAGES:
