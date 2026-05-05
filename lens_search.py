@@ -13,7 +13,13 @@ IMAGES_FOLDER = r"C:\Users\Dan\Desktop\Poze produse"
 OUTPUT_EXCEL  = r"C:\Users\Dan\Desktop\rezultate_lens.xlsx"
 CHECKPOINT    = r"C:\Users\Dan\Desktop\lens_progress.json"
 
-LIMIT_IMAGES  = 5       # None = toate; 5 = test pilot
+LIMIT_IMAGES  = None    # None = toate imaginile din folder
+
+BLACKLIST_DOMAINS = {
+    "ieftinmag.ro", "cel.ro", "autoconfort.ro", "evomag.ro",
+    "vexio.ro", "flanco.ro", "altex.ro", "domo.ro",
+    "okazii.ro", "roveli.ro", "teamdeals.ro", "emagiacumparaturilor.ro",
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 import base64
@@ -147,7 +153,8 @@ def serpapi_lens(image_url: str) -> list[dict]:
         return []
 
 
-def top_ro_matches(matches: list[dict], max_per_image: int = 5) -> list[dict]:
+def top_ro_matches(matches: list[dict]) -> list[dict]:
+    """Returnează TOATE site-urile .ro distincte, excluzând blacklist-ul."""
     seen_domains: set[str] = set()
     results = []
     for m in matches:
@@ -157,10 +164,10 @@ def top_ro_matches(matches: list[dict], max_per_image: int = 5) -> list[dict]:
         domain = urlparse(link).netloc.lower().lstrip("www.")
         if domain in seen_domains:
             continue
+        if domain in BLACKLIST_DOMAINS:
+            continue
         seen_domains.add(domain)
         results.append({"domain": domain, "url": link})
-        if len(results) >= max_per_image:
-            break
     return results
 
 
@@ -276,7 +283,18 @@ HDR_FILL   = PatternFill("solid", fgColor="1F4E79")
 HDR_FONT   = Font(bold=True, color="FFFFFF", size=10)
 ALT_FILL   = PatternFill("solid", fgColor="D6E4F0")
 PLAIN_FILL = PatternFill("solid", fgColor="FFFFFF")
-SITE_COLORS = ["E8F5E9", "FFF9C4", "FCE4EC", "EDE7F6", "E0F2F1"]
+
+# culori ciclice pentru grupuri de site-uri
+_SITE_PALETTE = [
+    "E8F5E9", "FFF9C4", "FCE4EC", "EDE7F6", "E0F2F1",
+    "FBE9E7", "E3F2FD", "F9FBE7", "FCE4EC", "E8EAF6",
+    "EFEBE9", "F3E5F5", "E0F7FA", "FFFDE7", "F1F8E9",
+]
+
+
+def _site_fill(i: int) -> PatternFill:
+    color = _SITE_PALETTE[i % len(_SITE_PALETTE)]
+    return PatternFill("solid", fgColor=color)
 
 
 def _hdr(cell, text):
@@ -289,19 +307,27 @@ def _hdr(cell, text):
 def build_excel(state: dict, output_path: str):
     wb = Workbook()
 
-    # ── Sheet 1 ───────────────────────────────────────────────────────────────
+    # ── calculează numărul maxim de site-uri din toate rezultatele ────────────
+    max_sites = max(
+        (len(d.get("sites", [])) for d in state["results"].values()),
+        default=1,
+    )
+    max_sites = max(max_sites, 1)   # cel puțin 1 coloană site
+    last_data_col = 2 + max_sites * 4   # A=1, B=2, apoi 4 col/site
+
+    # ── Sheet 1: Rezultate per Imagine ────────────────────────────────────────
     ws1 = wb.active
     ws1.title = "Rezultate per Imagine"
 
     _hdr(ws1["A1"], "Nr")
     _hdr(ws1["B1"], "Imagine")
     col = 3
-    for i in range(1, 6):
-        fill = PatternFill("solid", fgColor=SITE_COLORS[i - 1])
+    for i in range(1, max_sites + 1):
+        sf = _site_fill(i - 1)
         for sub in ("Domeniu", "URL", "Email", "Telefon"):
             c = ws1.cell(row=1, column=col, value=f"Site {i} — {sub}")
             c.font = Font(bold=True, size=9)
-            c.fill = fill
+            c.fill = sf
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             col += 1
 
@@ -314,32 +340,35 @@ def build_excel(state: dict, output_path: str):
         ws1.cell(row=row, column=1, value=int(img_key)).fill = fill
         ws1.cell(row=row, column=2, value=data.get("filename", f"{img_key}.jpg")).fill = fill
         col = 3
-        for site in data.get("sites", [])[:5]:
-            vals = [
+        for site in data.get("sites", []):
+            for v in [
                 site.get("domain", ""),
                 site.get("url", ""),
                 ", ".join(site.get("emails", [])),
                 ", ".join(site.get("phones", [])),
-            ]
-            for v in vals:
+            ]:
                 c = ws1.cell(row=row, column=col, value=v)
                 c.fill = fill
                 c.alignment = Alignment(wrap_text=True, vertical="top")
                 col += 1
-        while col <= 22:
+        # completează coloanele rămase goale până la ultima coloană header
+        while col <= last_data_col:
             ws1.cell(row=row, column=col).fill = fill
             col += 1
         row += 1
 
+    # lățimi coloane Sheet 1
     ws1.column_dimensions["A"].width = 6
     ws1.column_dimensions["B"].width = 18
-    for i in range(3, 23):
-        letter = get_column_letter(i)
-        ws1.column_dimensions[letter].width = [18, 40, 30, 20][(i - 3) % 4]
+    col_widths = [18, 40, 30, 20]
+    for i in range(3, last_data_col + 1):
+        ws1.column_dimensions[get_column_letter(i)].width = col_widths[(i - 3) % 4]
 
-    # ── Sheet 2 ───────────────────────────────────────────────────────────────
+    # ── Sheet 2: Cumulat per Site ─────────────────────────────────────────────
     ws2 = wb.create_sheet("Cumulat per Site")
-    for ci, h in enumerate(["Domeniu", "Nr produse", "Email-uri", "Telefoane", "Lista numere imagini"], 1):
+    for ci, h in enumerate(
+        ["Domeniu", "Nr produse", "Email-uri", "Telefoane", "Lista numere imagini"], 1
+    ):
         _hdr(ws2.cell(row=1, column=ci), h)
 
     ws2.freeze_panes = "A2"
@@ -442,9 +471,19 @@ def main():
         if _shutdown:
             break
 
-        matches  = serpapi_lens(pub_url)
+        try:
+            matches = serpapi_lens(pub_url)
+        except Exception as e:
+            log(f"  SerpApi excepție neașteptată: {e} — salvez progresul și continui.", idx, total)
+            matches = []
+
+        if not matches and pub_url:
+            # serpapi_lens a returnat [] fie din eroare, fie că nu există rezultate —
+            # înregistrăm oricum ca să nu pierdem progresul
+            log(f"  Niciun rezultat SerpApi (eroare sau produs negăsit).", idx, total)
+
         ro_sites = top_ro_matches(matches)
-        log(f"  → {len(ro_sites)} site-uri .ro găsite", idx, total)
+        log(f"  → {len(ro_sites)} site-uri .ro (după filtrare blacklist)", idx, total)
 
         sites_data = []
         for site in ro_sites:
@@ -466,7 +505,10 @@ def main():
         state["done"].append(img_key)
         save_checkpoint(state)
         log(f"Checkpoint + Excel salvat.", idx, total)
-        build_excel(state, OUTPUT_EXCEL)
+        try:
+            build_excel(state, OUTPUT_EXCEL)
+        except Exception as e:
+            log(f"  Avertisment: Excel rebuild eșuat: {e}", idx, total)
 
     # 4. Sumar
     processed  = len(state["results"])
